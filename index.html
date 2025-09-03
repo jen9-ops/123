@@ -1,0 +1,166 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Синхронизированная карта</title>
+
+    <!-- Подключаем CSS Leaflet -->
+    <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" integrity="sha256-p4NxAoJBhIIN+hmNHrzRCf9tD/miZyoHS5obTRR9BMY=" crossorigin=""/>
+    
+    <!-- Подключаем ваши стили -->
+    <link rel="stylesheet" href="https://jen9-ops.github.io/library/style.css">
+
+    <style>
+        html, body {
+            height: 100%;
+            margin: 0;
+            padding: 0;
+            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+            display: flex;
+            flex-direction: column;
+        }
+        #map {
+            flex-grow: 1; /* Карта занимает все доступное пространство */
+            width: 100%;
+        }
+        #info-panel {
+            background-color: rgba(255, 255, 255, 0.9);
+            padding: 10px 15px;
+            text-align: center;
+            border-bottom: 1px solid #ddd;
+            box-shadow: 0 2px 5px rgba(0,0,0,0.1);
+            z-index: 1000; /* Панель поверх карты */
+        }
+        #info-panel p {
+            margin: 5px 0;
+            font-size: 14px;
+        }
+        #share-url {
+            width: 100%;
+            max-width: 400px;
+            padding: 5px;
+            border: 1px solid #ccc;
+            border-radius: 4px;
+            font-size: 12px;
+            text-align: center;
+            background-color: #f9f9f9;
+            cursor: pointer;
+        }
+        #share-url:focus {
+            outline: none;
+            border-color: #007bff;
+        }
+    </style>
+</head>
+<body>
+
+    <div id="info-panel">
+        <p><strong>Карта в реальном времени</strong></p>
+        <p>Отправьте эту ссылку другим, чтобы синхронизировать карту:</p>
+        <input type="text" id="share-url" readonly onclick="this.select()">
+    </div>
+    
+    <div id="map"></div>
+
+    <!-- Подключаем JS Leaflet -->
+    <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js" integrity="sha256-20nQCchB9co0qIjJZRGuk2/Z9VM+kNiyxNV1lvTlZBo=" crossorigin=""></script>
+    
+    <!-- Подключаем ваши скрипты -->
+    <script src="https://jen9-ops.github.io/library/script.js"></script>
+
+    <!-- Подключаем Firebase SDK -->
+    <script type="module">
+        import { initializeApp } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-app.js";
+        import { getAuth, signInAnonymously, signInWithCustomToken } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-auth.js";
+        import { getFirestore, doc, onSnapshot, setDoc } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-firestore.js";
+
+        // --- 1. НАСТРОЙКА FIREBASE ---
+        const firebaseConfig = JSON.parse(typeof __firebase_config !== 'undefined' ? __firebase_config : '{}');
+        const appId = typeof __app_id !== 'undefined' ? __app_id : 'default-app-id';
+        
+        const app = initializeApp(firebaseConfig);
+        const auth = getAuth(app);
+        const db = getFirestore(app);
+        
+        // --- 2. АУТЕНТИФИКАЦИЯ ПОЛЬЗОВАТЕЛЯ ---
+        if (typeof __initial_auth_token !== 'undefined') {
+            await signInWithCustomToken(auth, __initial_auth_token);
+        } else {
+            await signInAnonymously(auth);
+        }
+        
+        // --- 3. УПРАВЛЕНИЕ СЕССИЕЙ ---
+        function getSessionId() {
+            if (window.location.hash) {
+                return window.location.hash.substring(1);
+            }
+            // Генерируем новый ID, если его нет
+            const newId = Math.random().toString(36).substring(2, 9);
+            window.location.hash = newId;
+            return newId;
+        }
+        
+        const sessionId = getSessionId();
+        const shareUrlInput = document.getElementById('share-url');
+        shareUrlInput.value = window.location.href;
+        
+        // Создаем ссылку на документ в Firestore для этой сессии
+        const docRef = doc(db, `/artifacts/${appId}/public/data/map_sessions`, sessionId);
+
+        // --- 4. ИНИЦИАЛИЗАЦИЯ КАРТЫ LEAFLET ---
+        const map = L.map('map').setView([50.4501, 30.5234], 13);
+        L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
+            attribution: '&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors'
+        }).addTo(map);
+
+        let isUpdatingFromFirestore = false; // Флаг для предотвращения зацикливания
+
+        // --- 5. СИНХРОНИЗАЦИЯ: СЛУШАЕМ ИЗМЕНЕНИЯ В FIRESTORE ---
+        onSnapshot(docRef, (doc) => {
+            if (doc.exists()) {
+                const data = doc.data();
+                const currentCenter = map.getCenter();
+                const currentZoom = map.getZoom();
+
+                // Проверяем, отличаются ли данные, чтобы не обновлять карту без надобности
+                if (data.zoom !== currentZoom || Math.abs(data.lat - currentCenter.lat) > 0.00001 || Math.abs(data.lng - currentCenter.lng) > 0.00001) {
+                    isUpdatingFromFirestore = true; // Ставим флаг, что обновление пришло извне
+                    map.flyTo([data.lat, data.lng], data.zoom);
+                    
+                    // Снимаем флаг после завершения анимации
+                    map.once('moveend', () => {
+                       isUpdatingFromFirestore = false;
+                    });
+                }
+            }
+        });
+
+        // --- 6. СИНХРОНИЗАЦИЯ: ОТПРАВЛЯЕМ ИЗМЕНЕНИЯ В FIRESTORE ---
+        function updateFirestore() {
+            // Не отправляем данные, если карта обновляется из Firestore
+            if (isUpdatingFromFirestore) {
+                return;
+            }
+            
+            const center = map.getCenter();
+            const zoom = map.getZoom();
+            
+            const mapState = {
+                lat: center.lat,
+                lng: center.lng,
+                zoom: zoom
+            };
+            
+            // Записываем новое состояние карты в Firestore
+            setDoc(docRef, mapState, { merge: true });
+        }
+
+        // Отслеживаем события перемещения и масштабирования карты
+        map.on('moveend', updateFirestore);
+        map.on('zoomend', updateFirestore);
+
+    </script>
+</body>
+</html>
+
