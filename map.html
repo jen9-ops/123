@@ -1,0 +1,182 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Карта обстановки</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
+    <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" integrity="sha256-p4NxAoJBhIIN+hmNHrzRCf9tD/miZyoHS5obTRR9BMY=" crossorigin=""/>
+    <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js" integrity="sha256-20nQCchB9co0qIjJZRGuk2/Z9VM+kNiyxNV1lvTlZBo=" crossorigin=""></script>
+    <script src="https://cdn.jsdelivr.net/npm/mgrs@2.0.0/mgrs.min.js"></script>
+    <style>
+        html, body {
+            height: 100%;
+            margin: 0;
+            padding: 0;
+            overflow: hidden;
+            background-color: #111827;
+        }
+        #map {
+            width: 100%;
+            height: 100%;
+            background-color: #374151;
+        }
+        .leaflet-popup-content-wrapper {
+            background: #1f2937;
+            color: #d1d5db;
+            border-radius: 8px;
+        }
+        .leaflet-popup-content {
+            font-family: 'Inter', sans-serif;
+            font-size: 14px;
+        }
+        .leaflet-popup-tip {
+            background: #1f2937;
+        }
+    </style>
+</head>
+<body>
+    <div id="map"></div>
+    <script>
+        const googleScriptUrl = 'ВАШ_URL_СКРИПТА_ЗДЕСЬ';
+        const EARTH_RADIUS = 6371e3;
+
+        let map = L.map('map', { attributionControl: false }).setView([49.0, 32.0], 7);
+        L.tileLayer('https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}', {
+            attribution: 'Tiles &copy; Esri'
+        }).addTo(map);
+
+        let markersLayer = L.layerGroup().addTo(map);
+
+        function calculateDestinationPoint(lat, lon, bearing, distance) {
+            const toRadians = (deg) => deg * Math.PI / 180;
+            const toDegrees = (rad) => rad * 180 / Math.PI;
+
+            const latRad = toRadians(lat);
+            const lonRad = toRadians(lon);
+            const bearingRad = toRadians(bearing);
+            const angularDistance = distance / EARTH_RADIUS;
+
+            const destLatRad = Math.asin(Math.sin(latRad) * Math.cos(angularDistance) +
+                                        Math.cos(latRad) * Math.sin(angularDistance) * Math.cos(bearingRad));
+
+            let destLonRad = lonRad + Math.atan2(Math.sin(bearingRad) * Math.sin(angularDistance) * Math.cos(latRad),
+                                                Math.cos(angularDistance) - Math.sin(latRad) * Math.sin(destLatRad));
+            
+            return { lat: toDegrees(destLatRad), lon: toDegrees(destLonRad) };
+        }
+        
+        async function fetchData() {
+            if (googleScriptUrl === 'ВАШ_URL_СКРИПТА_ЗДЕСЬ') {
+                console.error("URL скрипта не установлен!");
+                return;
+            }
+            try {
+                const response = await fetch(googleScriptUrl);
+                const data = await response.json();
+                updateMap(data.data);
+            } catch (error) {
+                console.error("Ошибка загрузки данных:", error);
+            }
+        }
+
+        function updateMap(events) {
+            markersLayer.clearLayers();
+            const bounds = L.latLngBounds();
+
+            events.forEach(event => {
+                const userLocation = { lat: event.UserLat, lon: event.UserLon };
+                if (!event.EventName.includes("Минометный")) return;
+                
+                const distances = (event.DistanceLog && event.DistanceLog.length > 0) ? event.DistanceLog.map(d => d.distance) : [parseFloat(event.Distance)];
+                if (distances.every(isNaN)) return;
+                
+                // Add user marker for context if not already there
+                if (!bounds.contains([userLocation.lat, userLocation.lon])) {
+                     L.marker([userLocation.lat, userLocation.lon]).addTo(markersLayer).bindPopup(`<b>Позиция (${event.Shift})</b>`);
+                     bounds.extend([userLocation.lat, userLocation.lon]);
+                }
+               
+                if (event.Azimuth && event.Azimuth.includes('-')) {
+                    const parts = event.Azimuth.split('-').map(Number);
+                    let [startBearing, endBearing] = parts;
+                    if (isNaN(startBearing) || isNaN(endBearing)) return;
+                    if (endBearing < startBearing) endBearing += 360;
+                    
+                    const latestDistances = distances.slice(-4);
+                    const sectorColors = ['#facc15', '#fb923c', '#f87171', '#e11d48'];
+
+                    latestDistances.forEach((distance, index) => {
+                        if(isNaN(distance)) return;
+                        
+                        const steps = 20;
+                        const angleStep = (endBearing - startBearing) / steps;
+                        const eventTime = new Date(event.Timestamp).toLocaleTimeString('ru-RU');
+                        const popupContent = `<b>${event.EventName}</b><br>Время: ${eventTime}<br>Дистанция: ~${distance} м.<br>Азимут: ${event.Azimuth}°`;
+                        
+                        const points = [[userLocation.lat, userLocation.lon]];
+                        for (let i = 0; i <= steps; i++) {
+                            const bearing = startBearing + i * angleStep;
+                            const point = calculateDestinationPoint(userLocation.lat, userLocation.lon, bearing % 360, distance);
+                            points.push([point.lat, point.lon]);
+                        }
+                        
+                        const color = sectorColors[index % sectorColors.length];
+                        const sector = L.polygon(points, { color: color, fillColor: color, fillOpacity: 0.35, weight: 1 }).addTo(markersLayer);
+                        sector.bindPopup(popupContent);
+                        bounds.extend(sector.getBounds());
+                    });
+                } else if (event.Azimuth) {
+                    const bearing = parseFloat(event.Azimuth);
+                    if (isNaN(bearing)) return;
+                    
+                    distances.forEach(distance => {
+                        if(isNaN(distance)) return;
+                        const eventPoint = calculateDestinationPoint(userLocation.lat, userLocation.lon, bearing, distance);
+                        const eventTime = new Date(event.Timestamp).toLocaleTimeString('ru-RU');
+                        const mgrsString = mgrs.forward([eventPoint.lon, eventPoint.lat]);
+                        const popupContent = `<b>${event.EventName}</b><br>Время: ${eventTime}<br>Дистанция: ~${distance} м.<br>MGRS: ${mgrsString}`;
+                        
+                        L.marker([eventPoint.lat, eventPoint.lon], {
+                             icon: L.icon({
+                                iconUrl: 'data:image/svg+xml;base64,' + btoa('<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="red" width="36px" height="36px"><path d="M0 0h24v24H0z" fill="none"/><path d="M12 2C8.13 2 5 5.13 5 9c0 5.25 7 13 7 13s7-7.75 7-13c0-3.87-3.13-7-7-7zm0 9.5c-1.38 0-2.5-1.12-2.5-2.5s1.12-2.5 2.5-2.5 2.5 1.12 2.5 2.5-1.12 2.5-2.5 2.5z"/></svg>')
+                            })
+                        }).addTo(markersLayer).bindPopup(popupContent);
+                        bounds.extend([eventPoint.lat, eventPoint.lon]);
+                    });
+                } else {
+                     distances.forEach(distance => {
+                        if(isNaN(distance)) return;
+                        const eventTime = new Date(event.Timestamp).toLocaleTimeString('ru-RU');
+                        const popupContent = `<b>${event.EventName}</b><br>Время: ${eventTime}<br>Дистанция: ~${distance} м.`;
+                        const circle = L.circle([userLocation.lat, userLocation.lon], { radius: distance, color: '#60a5fa', fillColor: '#3b82f6', fillOpacity: 0.2, weight: 1 }).addTo(markersLayer);
+                        circle.bindPopup(popupContent);
+                        bounds.extend(circle.getBounds());
+                    });
+                }
+            });
+
+            if(bounds.isValid()){
+                map.fitBounds(bounds.pad(0.2));
+            }
+        }
+
+        if ('serviceWorker' in navigator) {
+            window.addEventListener('load', () => {
+                navigator.serviceWorker.register('./sw-map.js').then(registration => {
+                    console.log('ServiceWorker for map registered: ', registration.scope);
+                }, err => {
+                    console.log('ServiceWorker for map registration failed: ', err);
+                });
+            });
+        }
+        
+        fetchData();
+        setInterval(fetchData, 60000); // Обновлять карту каждую минуту
+    </script>
+</body>
+</html>
+
